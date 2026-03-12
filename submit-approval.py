@@ -34,6 +34,13 @@ FEISHU_REMEDY_SUBMIT_CODES = {
     1226501: "无需补卡（用户当日无缺卡记录）"
 }
 
+# 打卡类型映射
+WORK_TYPE_MAP = {
+    1: "上班",
+    2: "下班",
+    -1: "未知类型"
+}
+
 # -------------------------- 通用工具函数 --------------------------
 def validate_feishu_params(app_id: str, app_secret: str, user_id: str) -> None:
     """校验飞书基础参数合法性"""
@@ -46,7 +53,7 @@ def validate_feishu_params(app_id: str, app_secret: str, user_id: str) -> None:
 
 def validate_remedy_params(remedy_data: Dict[str, Any]) -> None:
     """校验补卡提交参数合法性"""
-    required_fields = ["user_id", "remedy_date", "punch_no", "work_type", "remedy_time", "reason"]
+    required_fields = ["user_id", "remedy_date", "punch_no", "work_type", "normal_punch_time", "reason"]
     
     for field in required_fields:
         if field not in remedy_data:
@@ -69,9 +76,9 @@ def validate_remedy_params(remedy_data: Dict[str, Any]) -> None:
     
     # 校验时间格式
     try:
-        datetime.strptime(remedy_data["remedy_time"], "%Y-%m-%d %H:%M")
+        datetime.strptime(remedy_data["normal_punch_time"], "%Y-%m-%d %H:%M")
     except ValueError:
-        raise ValueError(f"remedy_time格式错误，需为YYYY-MM-DD HH:MM格式，当前值：{remedy_data['remedy_time']}")
+        raise ValueError(f"remedy_time格式错误，需为YYYY-MM-DD HH:MM格式，当前值：{remedy_data['normal_punch_time']}")
 
 def feishu_request(method: str, url: str, **kwargs) -> dict:
     """通用飞书API请求函数"""
@@ -153,7 +160,7 @@ def submit_feishu_remedy(
         "remedy_date": remedy_data["remedy_date"],
         "punch_no": remedy_data["punch_no"],
         "work_type": remedy_data["work_type"],
-        "remedy_time": remedy_data["remedy_time"],
+        "remedy_time": remedy_data["normal_punch_time"],
         "reason": remedy_data["reason"],
         "time": "-"
     }
@@ -217,13 +224,12 @@ def create_remedy_approval(
         return {"code": -1, "msg": "Token获取失败", "instance_code": "", "success": False}
 
     # 2. 解析补卡数据为审批表单格式
-    work_type_map = {1: "上班", 2: "下班", -1: "未知类型"}
-    work_type_desc = work_type_map.get(remedy_data["work_type"], "未知类型")
+    work_type_desc = WORK_TYPE_MAP.get(remedy_data["work_type"], "未知类型")
     
     abnormal_date = str(remedy_data["remedy_date"])
     abnormal_date = f"{abnormal_date[:4]}-{abnormal_date[4:6]}-{abnormal_date[6:]}"
     abnormal_record = f"缺卡类型：未打卡，班次类型：{work_type_desc}"
-    remedy_time = remedy_data["remedy_time"]
+    remedy_time = remedy_data["normal_punch_time"]
     remedy_reason = remedy_data["reason"]
     user_id = remedy_data["user_id"]
 
@@ -289,32 +295,35 @@ def create_remedy_approval(
         }
 
 # -------------------------- 核心流程入口 --------------------------
-def remedy_flow(
+def main(
     remedy_data: Dict[str, Any],
     app_id: str,
     app_secret: str,
-    approval_code: str,
-    tenant_token: str = ""
+    approval_code: str = "5E6B37FC-CB66-4B84-8F27-93B3C47D7F15",
+    tenant_access_token: str = ""
 ) -> Dict[str, Any]:
     """
     完整补卡流程：先提交考勤补卡 → 成功则发起审批
     :return: 整合后的流程结果
     """
     final_result = {
-        "remedy_step": {},  # 补卡接口结果
-        "approval_step": {},  # 审批发起结果
-        "flow_success": False  # 整体流程是否成功
+        "remedy": {},  # 补卡接口结果
+        "approval": {},  # 审批发起结果
+        "success": 0,
+        "message": ""  # 统一返回的提示信息
     }
 
     try:
         # 第一步：提交补卡申请
         logger.info("========== 开始执行补卡流程 ==========")
-        remedy_result = submit_feishu_remedy(remedy_data, app_id, app_secret, tenant_token)
-        final_result["remedy_step"] = remedy_result
+        remedy_result = submit_feishu_remedy(remedy_data, app_id, app_secret, tenant_access_token)
+        final_result["remedy"] = remedy_result
         
+        # 补卡失败：直接返回失败原因
         if not remedy_result["success"]:
-            logger.error(f"补卡提交失败，终止流程：{remedy_result['message']}")
-            final_result["flow_success"] = False
+            final_result["message"] = f"补卡失败：{remedy_result['message']}"
+            final_result["success"] = 0
+            logger.error(final_result["message"])
             return final_result
         
         # 第二步：补卡成功，发起审批
@@ -324,21 +333,31 @@ def remedy_flow(
             app_id=app_id,
             app_secret=app_secret,
             approval_code=approval_code,
-            tenant_token=tenant_token  # 复用补卡的Token
+            tenant_token=tenant_access_token
         )
-        final_result["approval_step"] = approval_result
-        final_result["flow_success"] = approval_result["success"]
+        final_result["approval"] = approval_result
         
+        # 审批成功：返回包含补卡时间、打卡类型的成功提示
         if approval_result["success"]:
-            logger.info("补卡流程全部完成：补卡提交成功 + 审批发起成功")
+            work_type_desc = WORK_TYPE_MAP.get(remedy_data["work_type"], "未知类型")
+            remedy_time = remedy_data["normal_punch_time"]
+            final_result["message"] = f"{remedy_time} {work_type_desc} 补卡申请已经发起"
+            final_result["success"] = 1
+            logger.info(final_result["message"])
+        
+        # 审批失败：返回补卡成功+审批失败的提示
         else:
-            logger.error(f"补卡提交成功，但审批发起失败：{approval_result['msg']}")
+            final_result["message"] = f"补卡提交成功，但审批发起失败：{approval_result['msg']}"
+            final_result["success"] = 0
+            logger.error(final_result["message"])
         
         return final_result
 
     except Exception as e:
-        logger.error(f"补卡流程执行异常：{str(e)}", exc_info=True)
-        final_result["flow_success"] = False
+        error_msg = f"补卡流程执行异常：{str(e)}"
+        logger.error(error_msg, exc_info=True)
+        final_result["message"] = error_msg
+        final_result["success"] = 0
         final_result["error"] = str(e)
         return final_result
 
@@ -358,18 +377,17 @@ if __name__ == "__main__":
         'remedy_date': 20260312,
         'punch_no': 0,
         'work_type': 1,
-        'remedy_time': '2026-03-12 09:00',
+        'normal_punch_time': '2026-03-12 09:00',
         'reason': '忘记打卡',
-        'time': '-'
     }
 
     # 3. 执行完整流程
-    flow_result = remedy_flow(
+    flow_result = main(
         remedy_data=EXTERNAL_REMEDY_DATA,
         app_id=CONFIG["APP_ID"],
         app_secret=CONFIG["APP_SECRET"],
         approval_code=CONFIG["APPROVAL_CODE"],
-        tenant_token=CONFIG["TENANT_TOKEN"]
+        tenant_access_token=CONFIG["TENANT_TOKEN"]
     )
 
     # 4. 输出结果
