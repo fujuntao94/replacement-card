@@ -390,7 +390,7 @@ if __name__ == "__main__":
         "APP_ID": "cli_a93bb2cf4d789cc9",
         "APP_SECRET": "aFyVc072SUFfSir3WgwBCd678ShnbwWO",
         "TENANT_TOKEN": "",
-        "DAY": 20260311  # 测试用补卡日期
+        "DAY": 20260312  # 测试用补卡日期
     }
 
     # 执行补卡查询
