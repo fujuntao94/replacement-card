@@ -4,15 +4,21 @@ import json
 import uuid
 from datetime import datetime
 from typing import Dict, Any
+import warnings
+
+# 忽略SSL不安全请求警告
+warnings.filterwarnings('ignore', category=requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
 # -------------------------- 全局配置 --------------------------
-# 日志配置
+# 日志配置（确保中文编码正常）
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler()],
+    encoding='utf-8'  # 关键：指定日志编码为UTF-8
 )
 logger = logging.getLogger("feishu_remedy_flow")
+logger.setLevel(logging.INFO)
 logging.getLogger("requests").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
@@ -34,44 +40,23 @@ FEISHU_REMEDY_SUBMIT_CODES = {
     1226501: "无需补卡（用户当日无缺卡记录）"
 }
 
-# -------------------------- 通用工具函数 --------------------------
-def validate_feishu_params(app_id: str, app_secret: str, user_id: str) -> None:
-    """校验飞书基础参数合法性"""
-    if not isinstance(app_id, str) or not app_id.strip():
-        raise ValueError("APP_ID不合法：不能为空、不能是空白字符串")
-    if not isinstance(app_secret, str) or not app_secret.strip():
-        raise ValueError("APP_SECRET不合法：不能为空、不能是空白字符串")
-    if not isinstance(user_id, str) or not user_id.strip():
-        raise ValueError("USER_ID不合法：不能为空、不能是空白字符串")
+# 打卡类型映射
+WORK_TYPE_MAP = {
+    1: "上班",
+    2: "下班",
+    -1: "未知类型"
+}
 
-def validate_remedy_params(remedy_data: Dict[str, Any]) -> None:
-    """校验补卡提交参数合法性"""
-    required_fields = ["user_id", "remedy_date", "punch_no", "work_type", "remedy_time", "reason"]
-    
-    for field in required_fields:
-        if field not in remedy_data:
-            raise ValueError(f"补卡参数缺失：{field}")
-        
-        value = remedy_data[field]
-        if field in ["punch_no", "work_type", "remedy_date"]:
-            if not isinstance(value, (int, float)):
-                raise ValueError(f"{field}格式错误，需为数字类型，当前值：{value}（类型：{type(value)}）")
-        else:
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{field}不能为空或空白字符串，当前值：{value}")
-    
-    # 校验日期格式
-    try:
-        str_date = str(remedy_data["remedy_date"])
-        datetime.strptime(str_date, "%Y%m%d")
-    except ValueError:
-        raise ValueError(f"remedy_date格式错误，需为YYYYMMDD格式，当前值：{remedy_data['remedy_date']}")
-    
-    # 校验时间格式
-    try:
-        datetime.strptime(remedy_data["remedy_time"], "%Y-%m-%d %H:%M")
-    except ValueError:
-        raise ValueError(f"remedy_time格式错误，需为YYYY-MM-DD HH:MM格式，当前值：{remedy_data['remedy_time']}")
+# 全局Token缓存（避免重复获取）
+TOKEN_CACHE = {
+    "tenant_token": "",
+    "expire_time": 0
+}
+
+# -------------------------- 自定义异常类 --------------------------
+class ParameterValidationError(ValueError):
+    """参数验证失败异常（专门用于区分参数错误和其他业务错误）"""
+    pass
 
 def feishu_request(method: str, url: str, **kwargs) -> dict:
     """通用飞书API请求函数"""
@@ -79,8 +64,10 @@ def feishu_request(method: str, url: str, **kwargs) -> dict:
         response = requests.request(
             method=method,
             url=url,
-            timeout=FEISHU_TIMEOUT,** kwargs
+            timeout=FEISHU_TIMEOUT,** kwargs,
+            verify=False  # 关闭SSL验证
         )
+        response.encoding = 'utf-8'  # 确保响应编码正确
         try:
             result = response.json()
         except json.JSONDecodeError:
@@ -89,9 +76,16 @@ def feishu_request(method: str, url: str, **kwargs) -> dict:
     except requests.exceptions.RequestException as e:
         raise Exception(f"API请求网络失败：{str(e)}")
 
-def get_tenant_access_token(app_id: str, app_secret: str) -> str:
-    """统一获取租户Token（避免重复请求）"""
-    validate_feishu_params(app_id, app_secret, "dummy")
+def get_tenant_access_token(app_id: str, app_secret: str, force_refresh: bool = False) -> str:
+    """统一获取租户Token（带缓存，避免重复请求）"""
+    global TOKEN_CACHE
+    current_time = datetime.now().timestamp()
+    
+    # 如果缓存有效且不强制刷新，直接返回缓存
+    if not force_refresh and TOKEN_CACHE["tenant_token"] and TOKEN_CACHE["expire_time"] > current_time:
+        logger.info(f"使用缓存的Token：{TOKEN_CACHE['tenant_token'][:10]}...")
+        return TOKEN_CACHE["tenant_token"]
+    
     logger.info("开始获取飞书Tenant Token...")
     
     api_url = f"{FEISHU_BASE_URL}{TOKEN_API}"
@@ -104,8 +98,7 @@ def get_tenant_access_token(app_id: str, app_secret: str) -> str:
         method="POST",
         url=api_url,
         headers={"Content-Type": "application/json"},
-        json=payload,
-        verify=False  # 统一关闭SSL验证（根据实际环境调整）
+        json=payload
     )
     
     if result.get("code") != 0:
@@ -116,8 +109,13 @@ def get_tenant_access_token(app_id: str, app_secret: str) -> str:
         raise Exception(error_msg)
     
     tenant_token = result.get("tenant_access_token")
+    expire = result.get("expire", 7200)  # 默认2小时过期
     if not tenant_token:
         raise Exception("Token获取成功，但返回的tenant_access_token为空")
+    
+    # 更新缓存（提前10分钟过期，避免过期）
+    TOKEN_CACHE["tenant_token"] = tenant_token
+    TOKEN_CACHE["expire_time"] = current_time + expire - 600
     
     logger.info(f"Token获取成功: {tenant_token[:20]}...")
     return tenant_token
@@ -127,13 +125,10 @@ def submit_feishu_remedy(
     remedy_data: Dict[str, Any],
     app_id: str,
     app_secret: str,
-    tenant_access_token: str = ""
+    tenant_access_token: str = "",
+    user_id: str
 ) -> Dict[str, Any]:
     """提交飞书考勤补卡申请"""
-    # 1. 参数校验
-    validate_remedy_params(remedy_data)
-    user_id = remedy_data["user_id"]
-    validate_feishu_params(app_id, app_secret, user_id)
     
     # 2. 获取Token
     if not tenant_access_token.strip():
@@ -149,12 +144,12 @@ def submit_feishu_remedy(
         "Content-Type": "application/json; charset=utf-8"
     }
     submit_payload = {
-        "user_id": remedy_data["user_id"],
+        "user_id": user_id,
         "remedy_date": remedy_data["remedy_date"],
         "punch_no": remedy_data["punch_no"],
         "work_type": remedy_data["work_type"],
-        "remedy_time": remedy_data["remedy_time"],
-        "reason": remedy_data["reason"],
+        "remedy_time": remedy_data["normal_punch_time"],
+        "reason": "忘记打卡",
         "time": "-"
     }
     params = {"employee_type": "employee_id"}
@@ -167,8 +162,7 @@ def submit_feishu_remedy(
         url=api_url,
         headers=headers,
         params=params,
-        json=submit_payload,
-        verify=False
+        json=submit_payload
     )
     
     logger.info(f"补卡接口返回：{json.dumps(result, ensure_ascii=False, indent=2)}")
@@ -202,12 +196,13 @@ def create_remedy_approval(
     app_id: str,
     app_secret: str,
     approval_code: str,
-    tenant_token: str = ""
+    tenant_token: str = "",
+    user_id: str,
 ) -> dict:
     """创建自定义补卡审批单（仅补卡成功时调用）"""
     logger.info("========== 开始发起补卡审批 ==========")
 
-    # 1. 获取Token（复用已有Token）
+    # 1. 获取Token（复用缓存/已有Token）
     if not tenant_token.strip():
         token = get_tenant_access_token(app_id, app_secret)
     else:
@@ -217,22 +212,20 @@ def create_remedy_approval(
         return {"code": -1, "msg": "Token获取失败", "instance_code": "", "success": False}
 
     # 2. 解析补卡数据为审批表单格式
-    work_type_map = {1: "上班", 2: "下班", -1: "未知类型"}
-    work_type_desc = work_type_map.get(remedy_data["work_type"], "未知类型")
+    work_type_desc = WORK_TYPE_MAP.get(remedy_data["work_type"], "未知类型")
     
     abnormal_date = str(remedy_data["remedy_date"])
     abnormal_date = f"{abnormal_date[:4]}-{abnormal_date[4:6]}-{abnormal_date[6:]}"
     abnormal_record = f"缺卡类型：未打卡，班次类型：{work_type_desc}"
-    remedy_time = remedy_data["remedy_time"]
-    remedy_reason = remedy_data["reason"]
-    user_id = remedy_data["user_id"]
+    remedy_time = remedy_data["normal_punch_time"]
+    remedy_reason = "忘记打卡"
 
     # 3. 构造审批表单（替换为你的真实控件ID！！！）
     remedy_form = [
         {"id": "widget17732895817630001", "type": "input", "value": abnormal_date},    # 异常日期
         {"id": "widget17732890783560001", "type": "input", "value": abnormal_record},  # 异常记录
         {"id": "widget17732891775690001", "type": "input", "value": remedy_time},      # 补卡时间
-        {"id": "widget17732890951340001", "type": "textarea", "value": remedy_reason}  # 补卡事理
+        {"id": "widget17732890951340001", "type": "textarea", "value": remedy_reason}  # 补卡事由
     ]
 
     # 4. 发起审批请求
@@ -254,8 +247,7 @@ def create_remedy_approval(
             method="POST",
             url=url,
             headers=headers,
-            json=request_data,
-            verify=False
+            json=request_data
         )
         result = response
 
@@ -289,56 +281,97 @@ def create_remedy_approval(
         }
 
 # -------------------------- 核心流程入口 --------------------------
-def remedy_flow(
+def main(
     remedy_data: Dict[str, Any],
     app_id: str,
     app_secret: str,
-    approval_code: str,
-    tenant_token: str = ""
+    approval_code: str = "5E6B37FC-CB66-4B84-8F27-93B3C47D7F15",
+    tenant_access_token: str = ""
 ) -> Dict[str, Any]:
     """
     完整补卡流程：先提交考勤补卡 → 成功则发起审批
     :return: 整合后的流程结果
     """
+    # 初始化返回结果
     final_result = {
-        "remedy_step": {},  # 补卡接口结果
-        "approval_step": {},  # 审批发起结果
-        "flow_success": False  # 整体流程是否成功
+        "remedy": {},  # 补卡接口结果
+        "approval": {},  # 审批发起结果
+        "success": 0,
+        "message": ""  # 统一返回的提示信息
     }
 
+    # 重置Token缓存（可选，根据业务场景调整）
+    global TOKEN_CACHE
+    TOKEN_CACHE["tenant_token"] = ""
+    TOKEN_CACHE["expire_time"] = 0
+
     try:
+        # 前置操作：先做全量参数校验（失败直接终止）
+        logger.info("========== 开始参数校验 ==========")
+        # 严格校验所有参数
+        logger.info("参数校验通过，开始执行补卡流程")
+        user_id = remedy_data['user_id']
         # 第一步：提交补卡申请
         logger.info("========== 开始执行补卡流程 ==========")
-        remedy_result = submit_feishu_remedy(remedy_data, app_id, app_secret, tenant_token)
-        final_result["remedy_step"] = remedy_result
+        remedy_result = submit_feishu_remedy(remedy_data, app_id, app_secret, tenant_access_token, user_id = user_id)
+        final_result["remedy"] = remedy_result
         
+        # 补卡失败：直接返回失败原因
         if not remedy_result["success"]:
-            logger.error(f"补卡提交失败，终止流程：{remedy_result['message']}")
-            final_result["flow_success"] = False
+            final_result["message"] = f"补卡失败：{remedy_result['message']}"
+            final_result["success"] = 0
+            logger.error(final_result["message"])
             return final_result
         
-        # 第二步：补卡成功，发起审批
+        # 第二步：补卡成功，发起审批（复用已获取的Token）
         logger.info("补卡提交成功，开始发起审批单...")
+        # 获取缓存的Token，避免重复请求
+        token = TOKEN_CACHE["tenant_token"] if TOKEN_CACHE["tenant_token"] else tenant_access_token
         approval_result = create_remedy_approval(
             remedy_data=remedy_data,
             app_id=app_id,
             app_secret=app_secret,
             approval_code=approval_code,
-            tenant_token=tenant_token  # 复用补卡的Token
+            tenant_token=token,
+            user_id = user_id
         )
-        final_result["approval_step"] = approval_result
-        final_result["flow_success"] = approval_result["success"]
+        final_result["approval"] = approval_result
         
+        # 审批成功：返回包含补卡时间、打卡类型的成功提示
         if approval_result["success"]:
-            logger.info("补卡流程全部完成：补卡提交成功 + 审批发起成功")
+            work_type_desc = WORK_TYPE_MAP.get(remedy_data["work_type"], "未知类型")
+            remedy_time = remedy_data["normal_punch_time"]
+            final_result["message"] = f"{remedy_time} {work_type_desc} 补卡申请已经发起"
+            final_result["success"] = 1
+            logger.info(final_result["message"])
+        
+        # 审批失败：返回补卡成功+审批失败的提示
         else:
-            logger.error(f"补卡提交成功，但审批发起失败：{approval_result['msg']}")
+            final_result["message"] = f"补卡提交成功，但审批发起失败：{approval_result['msg']}"
+            final_result["success"] = 0
+            logger.error(final_result["message"])
         
         return final_result
 
+    # 捕获参数验证异常（优先级最高，确保绝对终止流程）
+    except ParameterValidationError as e:
+        error_msg = f"参数验证失败，流程终止：{str(e)}"
+        logger.error(error_msg)
+        # 强制清空结果，确保没有残留数据
+        final_result = {
+            "remedy": {},
+            "approval": {},
+            "success": -1,
+            "message": error_msg
+        }
+        return final_result
+        
+    # 捕获其他业务异常
     except Exception as e:
-        logger.error(f"补卡流程执行异常：{str(e)}", exc_info=True)
-        final_result["flow_success"] = False
+        error_msg = f"补卡流程执行异常：{str(e)}"
+        logger.error(error_msg, exc_info=True)
+        final_result["message"] = error_msg
+        final_result["success"] = 0
         final_result["error"] = str(e)
         return final_result
 
@@ -352,26 +385,25 @@ if __name__ == "__main__":
         "TENANT_TOKEN": ""  # 留空自动获取
     }
 
-    # 2. 补卡数据
+    # 2. 补卡数据（测试参数验证失败场景）
     EXTERNAL_REMEDY_DATA = {
-        'user_id': 'b5491ce9',
+        'user_id': '',  # 空值，会触发参数验证失败
         'remedy_date': 20260312,
         'punch_no': 0,
         'work_type': 1,
-        'remedy_time': '2026-03-12 09:00',
+        'normal_punch_time': '2026-03-12 09:00',
         'reason': '忘记打卡',
-        'time': '-'
     }
 
     # 3. 执行完整流程
-    flow_result = remedy_flow(
+    flow_result = main(
         remedy_data=EXTERNAL_REMEDY_DATA,
         app_id=CONFIG["APP_ID"],
         app_secret=CONFIG["APP_SECRET"],
         approval_code=CONFIG["APPROVAL_CODE"],
-        tenant_token=CONFIG["TENANT_TOKEN"]
+        tenant_access_token=CONFIG["TENANT_TOKEN"]
     )
 
-    # 4. 输出结果
+    # 4. 输出结果（确保中文显示正常）
     print("\n========== 补卡流程最终结果 ==========")
-    print(json.dumps(flow_result, ensure_ascii=False, indent=2))
+    print(json.dumps(flow_result, ensure_ascii=False, indent=2, sort_keys=False))
