@@ -229,6 +229,7 @@ def create_remedy_approval(
     approval_code: str,
     tenant_token: str = "",
     user_id: str = "",
+    approval_id: str = ""
 ) -> dict:
     """创建自定义补卡审批单（仅补卡成功时调用）"""
     print("========== 开始发起补卡审批 ==========")
@@ -256,10 +257,11 @@ def create_remedy_approval(
 
     # 3. 构造审批表单（替换为你的真实控件ID！！！）
     remedy_form = [
-        {"id": "widget17732895817630001", "type": "input", "value": abnormal_date},    # 异常日期
-        {"id": "widget17732890783560001", "type": "input", "value": abnormal_record},  # 异常记录
-        {"id": "widget17732891775690001", "type": "input", "value": remedy_time},      # 补卡时间
-        {"id": "widget17732890951340001", "type": "textarea", "value": remedy_reason}  # 补卡事由
+        {"id": "ReplacementCardDate", "type": "input", "value": abnormal_date},    # 异常日期
+        {"id": "ReplacementCardRecord", "type": "input", "value": abnormal_record},  # 异常记录
+        {"id": "ReplacementCardTime", "type": "input", "value": remedy_time},      # 补卡时间
+        {"id": "ReplacementCardReason", "type": "textarea", "value": remedy_reason},  # 补卡事由
+        {"id": "ReplacementCardId", "type": "input", "value": approval_id}  # 补卡事由
     ]
 
     # 4. 发起审批请求
@@ -370,13 +372,17 @@ def main(
         print("补卡提交成功，开始发起审批单...")
         # 获取缓存的Token，避免重复请求
         token = TOKEN_CACHE["tenant_token"] if TOKEN_CACHE["tenant_token"] else tenant_access_token
+        data = remedy_result.get("data", {})
+        user_remedy = data.get("user_remedy", {})
+        approval_id = user_remedy.get("approval_id")
         approval_result = create_remedy_approval(
             remedy_data=remedy_data,
             app_id=app_id,
             app_secret=app_secret,
             approval_code=approval_code,
             tenant_token=token,
-            user_id=user_id
+            user_id=user_id,
+            approval_id = approval_id
         )
         final_result["approval"] = approval_result
         
@@ -418,34 +424,34 @@ def main(
         final_result["error"] = str(e)
         return final_result
 
-# if __name__ == "__main__":
-#     # 1. 配置信息（替换为你的真实值）
-#     CONFIG = {
-#         "APP_ID": "cli_a93bb2cf4d789cc9",
-#         "APP_SECRET": "aFyVc072SUFfSir3WgwBCd678ShnbwWO",
-#         "APPROVAL_CODE": "5E6B37FC-CB66-4B84-8F27-93B3C47D7F15",  # 自定义补卡审批模板编码
-#         "TENANT_TOKEN": ""  # 留空自动获取
-#     }
+if __name__ == "__main__":
+    # 1. 配置信息（替换为你的真实值）
+    CONFIG = {
+        "APP_ID": "cli_a93bb2cf4d789cc9",
+        "APP_SECRET": "aFyVc072SUFfSir3WgwBCd678ShnbwWO",
+        "APPROVAL_CODE": "5E6B37FC-CB66-4B84-8F27-93B3C47D7F15",  # 自定义补卡审批模板编码
+        "TENANT_TOKEN": ""  # 留空自动获取
+    }
 
-#     # 2. 补卡数据（测试参数验证失败场景）
-#     EXTERNAL_REMEDY_DATA = {
-#         'user_id': 'b5491ce9',  # 空值，会触发参数验证失败
-#         'remedy_date': 20260312,
-#         'punch_no': 0,
-#         'work_type': 1,
-#         'normal_punch_time': '2026-03-12 09:00',
-#         'reason': '忘记打卡',
-#     }
+    # 2. 补卡数据（测试参数验证失败场景）
+    EXTERNAL_REMEDY_DATA = {
+        'user_id': 'b5491ce9',  # 空值，会触发参数验证失败
+        'remedy_date': 20260323,
+        'punch_no': 0,
+        'work_type': 1,
+        'normal_punch_time': '2026-03-23 09:00',
+        'reason': '忘记打卡',
+    }
 
-#     # 3. 执行完整流程
-#     flow_result = main(
-#         remedy_data=EXTERNAL_REMEDY_DATA,
-#         app_id=CONFIG["APP_ID"],
-#         app_secret=CONFIG["APP_SECRET"],
-#         approval_code=CONFIG["APPROVAL_CODE"],
-#         tenant_access_token=CONFIG["TENANT_TOKEN"]
-#     )
+    # 3. 执行完整流程
+    flow_result = main(
+        remedy_data=EXTERNAL_REMEDY_DATA,
+        app_id=CONFIG["APP_ID"],
+        app_secret=CONFIG["APP_SECRET"],
+        approval_code=CONFIG["APPROVAL_CODE"],
+        tenant_access_token=CONFIG["TENANT_TOKEN"]
+    )
 
-#     # 4. 输出结果（确保中文显示正常）
-#     print("\n========== 补卡流程最终结果 ==========")
-#     print(json.dumps(flow_result, ensure_ascii=False, indent=2, sort_keys=False))
+    # 4. 输出结果（确保中文显示正常）
+    print("\n========== 补卡流程最终结果 ==========")
+    print(json.dumps(flow_result, ensure_ascii=False, indent=2, sort_keys=False))
